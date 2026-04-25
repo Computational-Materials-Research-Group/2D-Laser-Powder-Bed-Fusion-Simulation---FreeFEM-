@@ -1,0 +1,254 @@
+// ============================================
+// 2D Laser Powder Bed Fusion - FreeFEM++
+// N copper particles on steel substrate
+// Laser scans LEFT to RIGHT, melts particles
+// Output: VTU + PVD for ParaView animation
+// ============================================
+
+load "iovtk"
+
+string outdir = "D:\\freefem++\\laser_powder_new\\";
+system("mkdir \"D:\\freefem++\\laser_powder_new\"");
+
+// ============================================================
+// GEOMETRY
+// ============================================================
+real Lx      = 10e-3;
+real Ly      = 3e-3;
+real Rp      = 5e-4;
+int  Np      = 10;
+real dcell   = Lx / Np;
+real ycenter = Ly + Rp;
+real Htot    = Ly + 2.*Rp;
+
+int BotEdge   = 1;
+int RightEdge = 2;
+int TopEdge   = 3;
+int LeftEdge  = 4;
+
+border E1(t=0., Lx)   { x=t;    y=0.;     label=BotEdge;   }
+border E2(t=0., Htot) { x=Lx;   y=t;      label=RightEdge; }
+border E3(t=0., Lx)   { x=Lx-t; y=Htot;   label=TopEdge;   }
+border E4(t=0., Htot) { x=0.;   y=Htot-t; label=LeftEdge;  }
+
+mesh Th = buildmesh(E1(100) + E2(50) + E3(100) + E4(50));
+
+func rfineP = Rp / (1. + 20.*abs(y - ycenter) / Rp);
+Th = adaptmesh(Th, rfineP, IsMetric=1, nbvx=120000, hmax=dcell/6., hmin=Rp/12.);
+
+// ============================================================
+// MATERIAL PROPERTIES
+// ============================================================
+real rhoS  = 8000.;   real cpS  = 500.;    real kkS  = 50.;
+real TmS   = 1700.;
+
+real rhoP  = 8960.;   real cpP  = 385.;    real kkP  = 30.;
+real TmP   = 1356.;
+
+real rhoA  = 1.2;     real cpA  = 1000.;   real kkA  = 0.025;
+
+real hc    = 20.;
+real T0    = 300.;
+
+// ============================================================
+// BUILD P0 MATERIAL FIELDS
+// ============================================================
+fespace Ph(Th, P0);
+Ph rhoField, cpField, kkField, TmeltField;
+Ph isPartField, isSubField;
+
+for (int k = 0; k < Th.nt; k++) {
+    real xe = (Th[k][0].x + Th[k][1].x + Th[k][2].x) / 3.;
+    real ye = (Th[k][0].y + Th[k][1].y + Th[k][2].y) / 3.;
+
+    int inSub  = (ye <= Ly) ? 1 : 0;
+    int inPart = 0;
+    for (int ii = 0; ii < Np; ii++) {
+        real xci   = (ii + 0.5) * dcell;
+        real dist2 = (xe - xci)*(xe - xci) + (ye - ycenter)*(ye - ycenter);
+        if (dist2 <= Rp*Rp) { inPart = 1; }
+    }
+
+    isSubField[][k]  = inSub;
+    isPartField[][k] = inPart;
+
+    if (inSub == 1) {
+        rhoField[][k]   = rhoS;
+        cpField[][k]    = cpS;
+        kkField[][k]    = kkS;
+        TmeltField[][k] = TmS;
+    } else if (inPart == 1) {
+        rhoField[][k]   = rhoP;
+        cpField[][k]    = cpP;
+        kkField[][k]    = kkP;
+        TmeltField[][k] = TmP;
+    } else {
+        rhoField[][k]   = rhoA;
+        cpField[][k]    = cpA;
+        kkField[][k]    = kkA;
+        TmeltField[][k] = 9999.;
+    }
+}
+
+// ============================================================
+// LASER PARAMETERS
+// ============================================================
+real P      = 200.;
+real r0     = 4e-4;
+real absorb = 0.6;
+real r0sq   = r0 * r0;
+real Qpeak  = absorb * 2. * P / (pi * r0sq);
+
+// ============================================================
+// TIME / SCAN PARAMETERS
+// ============================================================
+real vbeam  = 3e-3;
+real tscan  = Lx / vbeam;
+real dt     = 2e-4;
+int  nt     = int(tscan / dt);
+real xstart = 0.;
+real xend   = Lx;
+real xc     = xstart;
+
+// ============================================================
+// FE SPACES AND FIELDS
+// ============================================================
+fespace Vh(Th, P1);
+Vh T, Told, v;
+Vh gradTx, gradTy, heatflux;
+Vh meltpool;
+Vh meltever;
+Vh meltdepth;
+Vh materialViz;
+
+T           = T0;
+Told        = T0;
+meltpool    = 0.;
+meltever    = 0.;
+materialViz = isPartField + 2.*isSubField;
+
+// ============================================================
+// ASSEMBLE LHS MATRIX ONCE
+// ============================================================
+varf aLHS(T, v) =
+      int2d(Th)( (rhoField*cpField/dt) * T * v )
+    + int2d(Th)( kkField * (dx(T)*dx(v) + dy(T)*dy(v)) )
+    + int1d(Th, BotEdge)(   hc * T * v )
+    + int1d(Th, RightEdge)( hc * T * v )
+    + int1d(Th, TopEdge)(   hc * T * v )
+    + int1d(Th, LeftEdge)(  hc * T * v )
+    ;
+
+matrix A = aLHS(Vh, Vh);
+set(A, solver=CG);
+
+// ============================================================
+// PVD HEADER
+// ============================================================
+{
+ofstream pvd(outdir + "laser_powder.pvd");
+pvd << "<?xml version=\"1.0\"?>" << endl;
+pvd << "<VTKFile type=\"Collection\" version=\"0.1\">" << endl;
+pvd << "<Collection>" << endl;
+}
+
+cout << "==========================================" << endl;
+cout << " Laser Powder Bed Fusion Simulation"        << endl;
+cout << " Save dir: D:\\freefem++\\laser_powder_new\\" << endl;
+cout << " Np     = " << Np        << " particles"    << endl;
+cout << " Rp     = " << Rp*1e3    << " mm"           << endl;
+cout << " P      = " << P         << " W"            << endl;
+cout << " r0     = " << r0*1e3    << " mm"           << endl;
+cout << " vbeam  = " << vbeam*1e3 << " mm/s"         << endl;
+cout << " TmeltP = " << TmP       << " K (copper)"   << endl;
+cout << " tscan  = " << tscan     << " s"            << endl;
+cout << " steps  = " << nt                           << endl;
+cout << "==========================================" << endl;
+
+// ============================================================
+// TIME LOOP
+// ============================================================
+for (int i = 1; i <= nt; i++) {
+    real t = i * dt;
+
+    xc = xstart + vbeam * t;
+    if (xc > xend) xc = xend;
+
+    varf aRHS(unused, v) =
+          int2d(Th)( (rhoField*cpField/dt) * Told * v )
+        + int1d(Th, BotEdge)(   hc * T0 * v )
+        + int1d(Th, RightEdge)( hc * T0 * v )
+        + int1d(Th, TopEdge)(   hc * T0 * v )
+        + int1d(Th, LeftEdge)(  hc * T0 * v )
+        + int1d(Th, TopEdge)(
+              Qpeak * exp(-2.*(x-xc)*(x-xc)/r0sq) * v
+          )
+        ;
+
+    real[int] b = aRHS(0, Vh);
+    T[] = A^-1 * b;
+
+    for (int j = 0; j < T[].n; j++)
+        if (T[][j] > TmP) T[][j] = TmP;
+
+    for (int j = 0; j < T[].n; j++) {
+        if (T[][j] >= TmP - 1.) {
+            meltpool[][j] = 1.;
+            meltever[][j] = 1.;
+        } else {
+            meltpool[][j] = 0.;
+        }
+    }
+
+    meltdepth = T - TmP;
+    Told      = T;
+    gradTx    = dx(T);
+    gradTy    = dy(T);
+    heatflux  = sqrt(dx(T)*dx(T) + dy(T)*dy(T));
+
+    if (i % 4 == 0) {
+        string num;
+        if      (i < 10)   num = "000" + i;
+        else if (i < 100)  num = "00"  + i;
+        else if (i < 1000) num = "0"   + i;
+        else               num = ""    + i;
+
+        int[int] ord = [1, 1, 1, 1, 1, 1, 1, 1];
+        savevtk(outdir + "result_" + num + ".vtu", Th,
+                T, meltpool, meltever, meltdepth,
+                gradTx, gradTy, heatflux, materialViz,
+                dataname = "Temperature MeltPool MeltEver MeltDepth gradTx gradTy HeatFlux Material",
+                order = ord);
+
+        {
+        ofstream pvd(outdir + "laser_powder.pvd", append);
+        pvd << "  <DataSet timestep=\"" << t
+            << "\" file=\"result_" << num << ".vtu\"/>" << endl;
+        }
+
+        int nmelt = 0;
+        for (int j = 0; j < T[].n; j++)
+            if (meltpool[][j] > 0.5) nmelt++;
+
+        int pIdx = int(xc / dcell);
+        if (pIdx >= Np) pIdx = Np - 1;
+
+        cout << "Step " << i << "/" << nt
+             << "  t="        << t        << " s"
+             << "  xbeam="    << xc*1e3   << " mm"
+             << "  Particle=" << pIdx+1   << "/" << Np
+             << "  Tmax="     << T[].max  << " K"
+             << "  Melt="     << nmelt    << " nodes" << endl;
+    }
+}
+
+// ============================================================
+// CLOSE PVD
+// ============================================================
+{
+ofstream pvd(outdir + "laser_powder.pvd", append);
+pvd << "</Collection>" << endl;
+pvd << "</VTKFile>"    << endl;
+}
+
+cout << "Done. Open laser_powder.pvd in ParaView." << endl;
